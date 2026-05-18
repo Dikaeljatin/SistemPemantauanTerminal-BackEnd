@@ -26,4 +26,10 @@ app.use('/api/auth', authRoutes);
 const userRoutes = require('./routes/userRoutes');
 app.use('/api/users', userRoutes);
 
+const jenisKendaraanRoutes = require('./routes/jenisKendaraanRoutes');
+app.use('/api/jenis-kendaraan', jenisKendaraanRoutes);
+
+const konfigurasiRoutes = require('./routes/konfigurasiRoutes');
+app.use('/api/konfigurasi', konfigurasiRoutes);
+
 module.exports = app;
