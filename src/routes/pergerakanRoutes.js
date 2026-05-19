@@ -1,6 +1,9 @@
 const express = require('express');
 const router = express.Router();
-const { createPergerakan, getAllPergerakan, deletePergerakan, updatePergerakan } = require('../controllers/pergerakanController');
+const { createPergerakan, getAllPergerakan, deletePergerakan, updatePergerakan, downloadTemplate } = require('../controllers/pergerakanController');
+
+// GET /api/pergerakan/template — Download template Excel untuk import
+router.get('/template', downloadTemplate);
 
 // POST /api/pergerakan — Simpan data pergerakan
 router.post('/', createPergerakan);

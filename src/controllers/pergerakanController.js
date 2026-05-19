@@ -1,5 +1,114 @@
 const pool = require('../config/db');
 
+// GET /api/pergerakan/template — Download template Excel untuk import data kendaraan
+exports.downloadTemplate = async (req, res) => {
+  try {
+    const XLSX = require('xlsx');
+    const wb = XLSX.utils.book_new();
+
+    // Header columns matching the import format
+    const headers = [
+      'Timestamp',
+      'Status',
+      'TNKB',
+      'Jenis Kendaraan',
+      'Jumlah Penumpang Kedatangan',
+      'Jumlah Penumpang Keberangkatan',
+      'Trayek Asal',
+      'Trayek Tujuan',
+      'Nama Perusahaan',
+    ];
+
+    // Example data rows
+    const exampleData = [
+      {
+        'Timestamp': '2025-01-15 08:30',
+        'Status': 'Kedatangan',
+        'TNKB': 'BL 1234 AB',
+        'Jenis Kendaraan': 'KIA',
+        'Jumlah Penumpang Kedatangan': 5,
+        'Jumlah Penumpang Keberangkatan': '',
+        'Trayek Asal': 'Banda Aceh',
+        'Trayek Tujuan': 'Blangpidie',
+        'Nama Perusahaan': 'Nagan Raya',
+      },
+      {
+        'Timestamp': '2025-01-15 09:00',
+        'Status': 'Keberangkatan',
+        'TNKB': 'BL 5678 CD',
+        'Jenis Kendaraan': 'HIACE',
+        'Jumlah Penumpang Kedatangan': '',
+        'Jumlah Penumpang Keberangkatan': 8,
+        'Trayek Asal': 'Blangpidie',
+        'Trayek Tujuan': 'Meulaboh',
+        'Nama Perusahaan': 'Flamboyan Jaya Pratama',
+      },
+      {
+        'Timestamp': '2025-01-15 10:15',
+        'Status': 'Kedatangan',
+        'TNKB': 'BL 9012 EF',
+        'Jenis Kendaraan': 'L300',
+        'Jumlah Penumpang Kedatangan': 3,
+        'Jumlah Penumpang Keberangkatan': '',
+        'Trayek Asal': 'Tapaktuan',
+        'Trayek Tujuan': 'Blangpidie',
+        'Nama Perusahaan': '-',
+      },
+    ];
+
+    // Create data sheet with examples
+    const ws = XLSX.utils.json_to_sheet(exampleData);
+
+    // Set column widths
+    ws['!cols'] = [
+      { wch: 20 }, // Timestamp
+      { wch: 16 }, // Status
+      { wch: 14 }, // TNKB
+      { wch: 18 }, // Jenis Kendaraan
+      { wch: 28 }, // Jumlah Penumpang Kedatangan
+      { wch: 30 }, // Jumlah Penumpang Keberangkatan
+      { wch: 18 }, // Trayek Asal
+      { wch: 18 }, // Trayek Tujuan
+      { wch: 24 }, // Nama Perusahaan
+    ];
+
+    XLSX.utils.book_append_sheet(wb, ws, 'Data Import');
+
+    // Create instruction sheet
+    const instruksi = [
+      { 'Kolom': 'Timestamp', 'Format': 'YYYY-MM-DD HH:mm', 'Contoh': '2025-01-15 08:30', 'Keterangan': 'Tanggal dan waktu pergerakan' },
+      { 'Kolom': 'Status', 'Format': 'Kedatangan / Keberangkatan', 'Contoh': 'Kedatangan', 'Keterangan': 'Status pergerakan kendaraan' },
+      { 'Kolom': 'TNKB', 'Format': 'Teks', 'Contoh': 'BL 1234 AB', 'Keterangan': 'Tanda Nomor Kendaraan' },
+      { 'Kolom': 'Jenis Kendaraan', 'Format': 'KIA / HIACE / L300 / MICROBUS', 'Contoh': 'KIA', 'Keterangan': 'Jenis kendaraan (huruf kapital)' },
+      { 'Kolom': 'Jumlah Penumpang Kedatangan', 'Format': 'Angka', 'Contoh': '5', 'Keterangan': 'Isi jika status = Kedatangan, kosongkan jika Keberangkatan' },
+      { 'Kolom': 'Jumlah Penumpang Keberangkatan', 'Format': 'Angka', 'Contoh': '8', 'Keterangan': 'Isi jika status = Keberangkatan, kosongkan jika Kedatangan' },
+      { 'Kolom': 'Trayek Asal', 'Format': 'Teks', 'Contoh': 'Banda Aceh', 'Keterangan': 'Nama kota asal (gunakan nama lengkap)' },
+      { 'Kolom': 'Trayek Tujuan', 'Format': 'Teks', 'Contoh': 'Blangpidie', 'Keterangan': 'Nama kota tujuan (gunakan nama lengkap)' },
+      { 'Kolom': 'Nama Perusahaan', 'Format': 'Teks', 'Contoh': 'Nagan Raya', 'Keterangan': 'Nama perusahaan, isi - jika tidak ada' },
+    ];
+
+    const ws2 = XLSX.utils.json_to_sheet(instruksi);
+    ws2['!cols'] = [
+      { wch: 30 }, // Kolom
+      { wch: 35 }, // Format
+      { wch: 24 }, // Contoh
+      { wch: 50 }, // Keterangan
+    ];
+    XLSX.utils.book_append_sheet(wb, ws2, 'Petunjuk Pengisian');
+
+    // Write to buffer
+    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+    // Send file
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="Template_Import_Data_Kendaraan.xlsx"');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Error downloadTemplate:', error);
+    res.status(500).json({ error: 'Gagal generate template' });
+  }
+};
+
 // POST /api/pergerakan — Simpan data pergerakan kendaraan
 exports.createPergerakan = async (req, res) => {
   try {
