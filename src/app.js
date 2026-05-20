@@ -32,4 +32,10 @@ app.use('/api/jenis-kendaraan', jenisKendaraanRoutes);
 const konfigurasiRoutes = require('./routes/konfigurasiRoutes');
 app.use('/api/konfigurasi', konfigurasiRoutes);
 
+const prediksiRoutes = require('./routes/prediksiRoutes');
+app.use('/api/prediksi', prediksiRoutes);
+
+const activityRoutes = require('./routes/activityRoutes');
+app.use('/api/activity', activityRoutes);
+
 module.exports = app;

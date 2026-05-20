@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const { logActivity } = require('./activityController');
 
 // GET /api/pergerakan/template — Download template Excel untuk import data kendaraan
 exports.downloadTemplate = async (req, res) => {
@@ -446,6 +447,14 @@ exports.createPergerakan = async (req, res) => {
       [kendaraan_id, trayek_asal, trayek_tujuan, jumlah_penumpang || 0, status_pergerakan, tsValue, created_by || null]
     );
 
+    // Log activity
+    await logActivity(
+      created_by || 'Petugas',
+      'create',
+      `Menginput data kendaraan ${status_pergerakan} - ${tnkb}`,
+      `Trayek: ${trayek_asal} → ${trayek_tujuan}, Penumpang: ${jumlah_penumpang || 0}`
+    );
+
     res.status(201).json({
       message: 'Data pergerakan berhasil disimpan',
       data: pergerakanResult.rows[0],
@@ -492,6 +501,7 @@ exports.getAllPergerakan = async (req, res) => {
 exports.deletePergerakan = async (req, res) => {
   try {
     const { id } = req.params;
+    const deleted_by = req.body.deleted_by || req.query.deleted_by || 'Petugas';
     const result = await pool.query(
       'DELETE FROM data_pergerakan WHERE pergerakan_id = $1 RETURNING *',
       [id]
@@ -499,6 +509,15 @@ exports.deletePergerakan = async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Data tidak ditemukan' });
     }
+
+    // Log activity
+    await logActivity(
+      deleted_by,
+      'delete',
+      `Menghapus data kendaraan - ID:${id}`,
+      `Status: ${result.rows[0].status_pergerakan}, Trayek: ${result.rows[0].trayek_asal} → ${result.rows[0].trayek_tujuan}`
+    );
+
     res.json({ message: 'Data berhasil dihapus', data: result.rows[0] });
   } catch (error) {
     console.error('Error deletePergerakan:', error);
@@ -541,6 +560,14 @@ exports.updatePergerakan = async (req, res) => {
         await pool.query('UPDATE perusahaan SET nama_perusahaan = $1 WHERE perusahaan_id = $2', [nama_perusahaan, kendaraanRes.rows[0].perusahaan_id]);
       }
     }
+
+    // Log activity
+    await logActivity(
+      updated_by || 'Petugas',
+      'update',
+      `Mengedit data kendaraan - ${tnkb || 'ID:' + id}`,
+      `Trayek: ${trayek_asal} → ${trayek_tujuan}`
+    );
 
     res.json({ message: 'Data berhasil diupdate', data: result.rows[0] });
   } catch (error) {
