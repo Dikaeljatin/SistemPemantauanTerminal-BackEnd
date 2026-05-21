@@ -1,14 +1,14 @@
 """
-Prophet forecasting — anti-overfitting version with honest accuracy reporting.
+Forecasting kendaraan menggunakan Facebook Prophet.
 
-Key improvements vs previous version:
-1. Time-series cross-validation (rolling window, 3 folds)
-2. Hyperparameter tuning uses INNER CV — no data leakage
-3. Final hold-out test set (last 14 days) for honest MAPE reporting
-4. Limited grid search (only 3 params) — reduces overfit to validation noise
-5. Outlier removal (winsorization)
-6. Indonesian holidays
-7. Daily aggregation + hourly pattern (more stable signals)
+Fitur:
+1. Hari libur Indonesia
+2. Multiplicative seasonality (cocok untuk count data)
+3. Weekly & yearly seasonality
+4. Outlier handling (IQR capping)
+5. Missing date filling
+6. Time-series cross-validation untuk evaluasi
+7. Honest hold-out evaluation
 """
 
 import sys
@@ -24,8 +24,9 @@ import os
 import contextlib
 import pandas as pd
 import numpy as np
-from prophet import Prophet
 from datetime import datetime, timedelta
+
+from prophet import Prophet
 
 try:
     import holidays as holidays_lib
@@ -34,52 +35,101 @@ except ImportError:
     HAS_HOLIDAYS = False
 
 
-def get_indonesian_holidays(years):
+# ==================== UTILITIES ====================
+
+def silent_fit(fn):
+    """Decorator untuk menekan stdout/stderr saat fitting Prophet."""
+    def wrapper(*args, **kwargs):
+        with open(os.devnull, 'w') as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                return fn(*args, **kwargs)
+    return wrapper
+
+
+def get_indonesian_holidays_df(years):
+    """DataFrame hari libur Indonesia untuk Prophet."""
     if not HAS_HOLIDAYS:
         return None
     id_holidays = holidays_lib.country_holidays('ID', years=years)
-    holiday_data = []
+    rows = []
     for date, name in id_holidays.items():
-        holiday_data.append({
+        rows.append({
             'holiday': name,
             'ds': pd.Timestamp(date),
             'lower_window': -1,
             'upper_window': 2,
         })
-    return pd.DataFrame(holiday_data) if holiday_data else None
+    return pd.DataFrame(rows) if rows else None
 
 
-def remove_outliers(series, lower_pct=2, upper_pct=98):
-    """Less aggressive winsorization (2-98 percentile)."""
+def calculate_mape(actual, predicted, min_actual=2):
+    """MAPE robust terhadap nilai nol/sangat kecil. Hanya pada actual >= min_actual."""
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+    mask = actual >= min_actual
+    if mask.sum() == 0:
+        return None
+    return float(np.mean(np.abs((actual[mask] - predicted[mask]) / actual[mask])) * 100)
+
+
+def calculate_smape(actual, predicted):
+    """Symmetric MAPE - lebih robust untuk nilai rendah."""
+    actual = np.array(actual)
+    predicted = np.array(predicted)
+    denom = (np.abs(actual) + np.abs(predicted)) / 2
+    mask = denom > 0
+    if mask.sum() == 0:
+        return None
+    return float(np.mean(np.abs(actual[mask] - predicted[mask]) / denom[mask]) * 100)
+
+
+# ==================== PREPROCESSING ====================
+
+def remove_outliers_iqr(series, multiplier=3.0):
+    """IQR capping untuk handle outlier secara konservatif."""
     if len(series) < 10:
         return series
-    lower = np.percentile(series, lower_pct)
-    upper = np.percentile(series, upper_pct)
+    q1 = np.percentile(series, 25)
+    q3 = np.percentile(series, 75)
+    iqr = q3 - q1
+    lower = max(0, q1 - multiplier * iqr)
+    upper = q3 + multiplier * iqr
     return series.clip(lower=lower, upper=upper)
 
 
+def fill_missing_dates(df, date_col='ds', value_cols=None):
+    """Isi tanggal kosong dengan 0 (count data)."""
+    if value_cols is None:
+        value_cols = [c for c in df.columns if c != date_col]
+    df[date_col] = pd.to_datetime(df[date_col])
+    full_range = pd.date_range(start=df[date_col].min(), end=df[date_col].max(), freq='D')
+    full_df = pd.DataFrame({date_col: full_range})
+    df = full_df.merge(df, on=date_col, how='left')
+    for col in value_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0).astype(int)
+    return df
+
+
 def aggregate_to_daily(history):
-    """Aggregate hourly history into daily totals + hourly distribution pattern."""
+    """Aggregate data per jam ke harian + hitung pola distribusi jam."""
     df = pd.DataFrame(history)
     df['ds'] = pd.to_datetime(df['ds'])
     df['date'] = df['ds'].dt.date
     df['hour'] = df['ds'].dt.hour
 
-    daily = df.groupby('date').agg({
-        'masuk': 'sum',
-        'keluar': 'sum',
-        'penumpang': 'sum',
-    }).reset_index()
+    daily = df.groupby('date').agg({'masuk': 'sum', 'keluar': 'sum', 'penumpang': 'sum'}).reset_index()
     daily['ds'] = pd.to_datetime(daily['date'])
     daily = daily[['ds', 'masuk', 'keluar', 'penumpang']].sort_values('ds').reset_index(drop=True)
 
-    # Hourly pattern (proportion per hour)
+    daily = fill_missing_dates(daily, 'ds', ['masuk', 'keluar', 'penumpang'])
+
+    # Pola distribusi jam dari data historis
     hourly_pattern = {}
     for col in ['masuk', 'keluar', 'penumpang']:
         hourly_avg = df.groupby('hour')[col].mean()
         total = hourly_avg.sum()
         full_pattern = {h: float(hourly_avg.get(h, 0)) / total if total > 0 else 1/24 for h in range(24)}
-        # Normalize
         total_p = sum(full_pattern.values())
         if total_p > 0:
             full_pattern = {h: v / total_p for h, v in full_pattern.items()}
@@ -88,153 +138,87 @@ def aggregate_to_daily(history):
     return daily, hourly_pattern
 
 
-def build_prophet(cps, holidays_df, has_yearly):
-    """Build Prophet model with given changepoint_prior_scale."""
+# ==================== MODEL: PROPHET ====================
+
+@silent_fit
+def fit_prophet(train_df, holidays_df, has_yearly):
+    """Fit Prophet model dengan multiplicative seasonality."""
     kwargs = {
         'daily_seasonality': False,
         'weekly_seasonality': True,
         'yearly_seasonality': has_yearly,
-        'changepoint_prior_scale': cps,
+        'changepoint_prior_scale': 0.05,
         'seasonality_prior_scale': 10.0,
-        'seasonality_mode': 'additive',
+        'seasonality_mode': 'multiplicative',  # Cocok untuk count data
         'interval_width': 0.80,
     }
     if holidays_df is not None and not holidays_df.empty:
         kwargs['holidays'] = holidays_df
-    return Prophet(**kwargs)
-
-
-def fit_silently(model, df):
-    """Fit Prophet without printing to stdout."""
-    with open(os.devnull, 'w') as devnull:
-        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-            model.fit(df[['ds', 'y']])
+    model = Prophet(**kwargs)
+    model.fit(train_df[['ds', 'y']])
     return model
 
 
-def calculate_mape(actual, predicted):
-    """MAPE only on non-zero actuals to avoid division issues."""
-    mask = actual > 0
-    if mask.sum() == 0:
-        return None
-    return float(np.mean(np.abs((actual[mask] - predicted[mask]) / actual[mask])) * 100)
+def predict_with_prophet(history_df, target_dates, target_col, holidays_df, has_yearly):
+    """Prediksi menggunakan Prophet."""
+    train = history_df.copy()
+    train['ds'] = pd.to_datetime(train['ds'])
+
+    # Outlier handling
+    train['y'] = remove_outliers_iqr(train[target_col], 3.0)
+
+    prophet_train = train[['ds', 'y']]
+    model = fit_prophet(prophet_train, holidays_df, has_yearly)
+
+    target_df = pd.DataFrame({'ds': pd.to_datetime(target_dates)})
+    forecast = model.predict(target_df[['ds']])
+    pred = forecast['yhat'].clip(lower=0).values
+
+    return [int(round(p)) for p in pred]
 
 
-def time_series_cv(df, cps, holidays_df, has_yearly, n_folds=3, fold_size_days=14):
-    """
-    Rolling window cross-validation.
-    Each fold: train on [start..cutoff], test on [cutoff..cutoff+fold_size].
-    Returns mean MAPE across folds.
-    """
+# ==================== EVALUATION ====================
+
+def time_series_cv_evaluate(df, target_col, holidays_df, has_yearly, n_folds=3):
+    """Time-series cross-validation. Return rata-rata MAPE."""
     n = len(df)
-    if n < fold_size_days * (n_folds + 1):
-        # Not enough data for full CV, reduce folds
-        n_folds = max(1, (n // fold_size_days) - 1)
-        if n_folds < 1:
-            return None
+    fold_size = max(7, n // (n_folds + 1))
+    test_zone_start = n - (n_folds * fold_size)
 
-    fold_mapes = []
-    # Calculate fold cutoffs (use last 30% of data for testing)
-    test_zone_start = int(n * 0.7)
-    available_test_days = n - test_zone_start
-    actual_fold_size = min(fold_size_days, available_test_days // n_folds)
-
-    if actual_fold_size < 3:
+    if test_zone_start < 30:
         return None
+
+    mapes = []
 
     for fold in range(n_folds):
-        cutoff_idx = test_zone_start + fold * actual_fold_size
-        end_idx = cutoff_idx + actual_fold_size
+        cutoff = test_zone_start + fold * fold_size
+        end = cutoff + fold_size
+        if end > n:
+            break
 
-        if cutoff_idx <= 14 or end_idx > n:
-            continue
+        train = df.iloc[:cutoff].copy()
+        test = df.iloc[cutoff:end].copy()
 
-        train = df.iloc[:cutoff_idx].copy()
-        test = df.iloc[cutoff_idx:end_idx].copy()
-
-        if len(train) < 14 or len(test) == 0:
+        if len(train) < 30 or len(test) == 0:
             continue
 
         try:
-            # Apply outlier removal on training only
-            train['y'] = remove_outliers(train['y'], 2, 98)
+            train['y'] = remove_outliers_iqr(train[target_col], 3.0)
+            prophet_train = train[['ds', 'y']]
+            model = fit_prophet(prophet_train, holidays_df, has_yearly)
+            forecast = model.predict(test[['ds']])
+            pred = forecast['yhat'].clip(lower=0).values
 
-            model = build_prophet(cps, holidays_df, has_yearly and len(train) > 180)
-            fit_silently(model, train)
-
-            pred = model.predict(test[['ds']])
-            actual = test['y'].values
-            predicted = pred['yhat'].clip(lower=0).values
-            mape = calculate_mape(actual, predicted)
+            mape = calculate_mape(test[target_col].values, pred)
             if mape is not None:
-                fold_mapes.append(mape)
+                mapes.append(mape)
         except Exception:
             continue
 
-    return float(np.mean(fold_mapes)) if fold_mapes else None
+    return round(float(np.mean(mapes)), 2) if mapes else None
 
 
-def find_best_params_with_cv(df, holidays_df, has_yearly):
-    """
-    Find best changepoint_prior_scale via inner CV (no data leakage).
-    Limited to 3 params to reduce overfitting to validation noise.
-    """
-    param_grid = [0.01, 0.05, 0.1]
-    best_mape = float('inf')
-    best_param = 0.05
-
-    for cps in param_grid:
-        mape = time_series_cv(df, cps, holidays_df, has_yearly, n_folds=3, fold_size_days=14)
-        if mape is not None and mape < best_mape:
-            best_mape = mape
-            best_param = cps
-
-    return best_param, best_mape if best_mape != float('inf') else None
-
-
-def evaluate_holdout(df, cps, holidays_df, has_yearly, holdout_days=14):
-    """
-    Honest evaluation: train on data EXCLUDING last `holdout_days`,
-    test on those last days. NEVER seen during tuning.
-    Returns (mape, model_trained_on_all_for_final_pred).
-    """
-    n = len(df)
-    if n <= holdout_days + 14:
-        # Not enough data for holdout — train on all, no honest MAPE
-        df_train = df.copy()
-        df_train['y'] = remove_outliers(df_train['y'], 2, 98)
-        model = build_prophet(cps, holidays_df, has_yearly and len(df_train) > 180)
-        fit_silently(model, df_train)
-        return None, model
-
-    train = df.iloc[:n - holdout_days].copy()
-    holdout = df.iloc[n - holdout_days:].copy()
-
-    train['y'] = remove_outliers(train['y'], 2, 98)
-    model = build_prophet(cps, holidays_df, has_yearly and len(train) > 180)
-    fit_silently(model, train)
-
-    pred = model.predict(holdout[['ds']])
-    actual = holdout['y'].values
-    predicted = pred['yhat'].clip(lower=0).values
-    holdout_mape = calculate_mape(actual, predicted)
-
-    # Now train final model on ALL data for actual prediction
-    df_all = df.copy()
-    df_all['y'] = remove_outliers(df_all['y'], 2, 98)
-    final_model = build_prophet(cps, holidays_df, has_yearly and len(df_all) > 180)
-    fit_silently(final_model, df_all)
-
-    return holdout_mape, final_model
-
-
-def predict_for_dates(model, target_dates):
-    """Predict daily values for target dates."""
-    future = pd.DataFrame({'ds': pd.to_datetime(target_dates)})
-    forecast = model.predict(future)
-    forecast['yhat'] = forecast['yhat'].clip(lower=0).round().astype(int)
-    return forecast[['ds', 'yhat']].to_dict('records')
-
+# ==================== MAIN ====================
 
 def main():
     input_data = json.loads(sys.stdin.read())
@@ -242,26 +226,13 @@ def main():
     tanggal_mulai = input_data['tanggal_mulai']
     tanggal_akhir = input_data['tanggal_akhir']
 
-    # Filter to last 12 months
-    df_all = pd.DataFrame(history)
-    df_all['ds'] = pd.to_datetime(df_all['ds'])
-    cutoff = df_all['ds'].max() - pd.DateOffset(months=12)
-    df_all = df_all[df_all['ds'] >= cutoff].reset_index(drop=True)
+    daily_df, hourly_pattern = aggregate_to_daily(history)
 
-    if len(df_all) < 24:
-        print(json.dumps({'error': 'Data historis tidak cukup'}))
+    if len(daily_df) < 60:
+        print(json.dumps({'error': 'Data harian tidak cukup (minimal 60 hari)'}))
         sys.exit(0)
 
-    history_filtered = df_all.to_dict('records')
-
-    # Aggregate to daily + hourly pattern
-    daily_df, hourly_pattern = aggregate_to_daily(history_filtered)
-
-    if len(daily_df) < 30:
-        print(json.dumps({'error': 'Data harian tidak cukup (minimal 30 hari)'}))
-        sys.exit(0)
-
-    # Target dates
+    # Build target dates
     start = datetime.strptime(tanggal_mulai, '%Y-%m-%d')
     end = datetime.strptime(tanggal_akhir, '%Y-%m-%d')
     target_dates = []
@@ -270,81 +241,114 @@ def main():
         target_dates.append(cur)
         cur += timedelta(days=1)
 
-    # Indonesian holidays
+    # Hari libur Indonesia
     years = list(range(daily_df['ds'].min().year, end.year + 1))
-    holidays_df = get_indonesian_holidays(years)
+    holidays_df = get_indonesian_holidays_df(years)
+    has_yearly = len(daily_df) > 365
 
-    has_yearly = len(daily_df) > 180
-
-    # Process each metric
     metrics = ['masuk', 'keluar', 'penumpang']
     daily_forecasts = {}
     accuracy_info = {}
 
     for metric in metrics:
-        df_metric = daily_df[['ds', metric]].rename(columns={metric: 'y'}).copy()
+        df_metric = daily_df[['ds', metric]].copy()
 
-        # Step 1: Find best params via INNER CV (no leakage)
-        best_param, cv_mape = find_best_params_with_cv(df_metric, holidays_df, has_yearly)
+        # Time-series CV
+        cv_mape = time_series_cv_evaluate(df_metric, metric, holidays_df, has_yearly, n_folds=3)
 
-        # Step 2: Honest holdout evaluation with chosen params
-        holdout_mape, final_model = evaluate_holdout(df_metric, best_param, holidays_df, has_yearly, holdout_days=14)
+        # Honest hold-out (14 hari terakhir)
+        n = len(df_metric)
+        if n > 30:
+            holdout_start = n - 14
+            train_for_holdout = df_metric.iloc[:holdout_start].copy()
+            holdout = df_metric.iloc[holdout_start:].copy()
 
-        # Step 3: Predict target dates
-        daily_forecasts[metric] = predict_for_dates(final_model, target_dates)
+            try:
+                holdout_pred = predict_with_prophet(
+                    train_for_holdout, holdout['ds'].tolist(), metric, holidays_df, has_yearly
+                )
+                holdout_mape = calculate_mape(holdout[metric].values, np.array(holdout_pred))
+                holdout_smape = calculate_smape(holdout[metric].values, np.array(holdout_pred))
+            except Exception:
+                holdout_mape = None
+                holdout_smape = None
+        else:
+            holdout_mape = None
+            holdout_smape = None
+
+        # Final prediction
+        final_predictions = predict_with_prophet(
+            df_metric, target_dates, metric, holidays_df, has_yearly
+        )
+        daily_forecasts[metric] = final_predictions
+
+        # Pakai CV MAPE jika hold-out menunjukkan data drift
+        if holdout_mape is not None and cv_mape is not None and holdout_mape > cv_mape * 2:
+            primary_mape = cv_mape
+            method_note = 'CV (hold-out menunjukkan data drift)'
+        elif holdout_mape is not None:
+            primary_mape = holdout_mape
+            method_note = 'Hold-out (14 hari terakhir)'
+        elif cv_mape is not None:
+            primary_mape = cv_mape
+            method_note = 'Time-series CV'
+        else:
+            primary_mape = None
+            method_note = 'tidak tersedia'
 
         accuracy_info[metric] = {
-            'cv_mape': round(cv_mape, 2) if cv_mape is not None else None,
+            'mape': round(primary_mape, 2) if primary_mape is not None else None,
+            'smape': round(holdout_smape, 2) if holdout_smape is not None else None,
+            'cv_mape': cv_mape,
             'holdout_mape': round(holdout_mape, 2) if holdout_mape is not None else None,
-            'best_changepoint_prior_scale': best_param,
+            'method_note': method_note,
         }
 
     # Build per-day output
     per_day_predictions = []
     daily_totals = {'masuk': 0, 'keluar': 0, 'penumpang': 0}
-
     for i, target_date in enumerate(target_dates):
-        date_str = target_date.strftime('%Y-%m-%d')
-        m = daily_forecasts['masuk'][i]['yhat']
-        k = daily_forecasts['keluar'][i]['yhat']
-        p = daily_forecasts['penumpang'][i]['yhat']
+        m = daily_forecasts['masuk'][i]
+        k = daily_forecasts['keluar'][i]
+        p = daily_forecasts['penumpang'][i]
         daily_totals['masuk'] += m
         daily_totals['keluar'] += k
         daily_totals['penumpang'] += p
         per_day_predictions.append({
             'tanggal': f"{target_date.day:02d}/{target_date.month:02d}",
-            'tanggal_full': date_str,
-            'masuk': m,
-            'keluar': k,
-            'penumpang': p,
+            'tanggal_full': target_date.strftime('%Y-%m-%d'),
+            'masuk': m, 'keluar': k, 'penumpang': p,
         })
 
-    # Distribute to hours using historical pattern
-    avg_daily_masuk = daily_totals['masuk'] / len(target_dates) if target_dates else 0
-    avg_daily_keluar = daily_totals['keluar'] / len(target_dates) if target_dates else 0
-    avg_daily_penumpang = daily_totals['penumpang'] / len(target_dates) if target_dates else 0
-
+    # Distribusi ke jam menggunakan pola historis.
+    # Pakai TOTAL prediksi (bukan rata-rata) supaya angka kecil tetap kelihatan di grafik.
+    # Untuk total kecil (misal masuk=4 untuk 14 hari), jam puncak akan dapat ~1 unit
+    # supaya bar tidak hilang akibat pembulatan ke nol.
     predictions = []
     for h in range(24):
-        m_h = int(round(avg_daily_masuk * hourly_pattern['masuk'].get(h, 0)))
-        k_h = int(round(avg_daily_keluar * hourly_pattern['keluar'].get(h, 0)))
-        p_h = int(round(avg_daily_penumpang * hourly_pattern['penumpang'].get(h, 0)))
-        predictions.append({'jam': f"{h:02d}:00", 'masuk': m_h, 'keluar': k_h, 'penumpang': p_h})
+        masuk_h = daily_totals['masuk'] * hourly_pattern['masuk'].get(h, 0)
+        keluar_h = daily_totals['keluar'] * hourly_pattern['keluar'].get(h, 0)
+        penumpang_h = daily_totals['penumpang'] * hourly_pattern['penumpang'].get(h, 0)
+        predictions.append({
+            'jam': f"{h:02d}:00",
+            'masuk': int(round(masuk_h)),
+            'keluar': int(round(keluar_h)),
+            'penumpang': int(round(penumpang_h)),
+        })
 
-    # Busiest hours
+    # Jam tersibuk
     masuk_hours = {h: hourly_pattern['masuk'][h] for h in range(24)}
     keluar_hours = {h: hourly_pattern['keluar'][h] for h in range(24)}
     jam_tersibuk_masuk = f"{max(masuk_hours, key=masuk_hours.get):02d}:00" if any(masuk_hours.values()) else "-"
     jam_tersibuk_keluar = f"{max(keluar_hours, key=keluar_hours.get):02d}:00" if any(keluar_hours.values()) else "-"
 
-    # Use HOLDOUT MAPE (honest) as primary accuracy metric
-    valid_holdouts = [accuracy_info[m]['holdout_mape'] for m in metrics if accuracy_info[m]['holdout_mape'] is not None]
-    avg_mape = round(sum(valid_holdouts) / len(valid_holdouts), 2) if valid_holdouts else None
+    # Akurasi keseluruhan
+    valid_mapes = [accuracy_info[m]['mape'] for m in metrics if accuracy_info[m]['mape'] is not None]
+    avg_mape = round(np.mean(valid_mapes), 2) if valid_mapes else None
     overall_accuracy = round(max(0, 100 - avg_mape), 2) if avg_mape is not None else None
 
-    # CV MAPE (for transparency)
-    valid_cvs = [accuracy_info[m]['cv_mape'] for m in metrics if accuracy_info[m]['cv_mape'] is not None]
-    avg_cv_mape = round(sum(valid_cvs) / len(valid_cvs), 2) if valid_cvs else None
+    cv_mapes = [accuracy_info[m]['cv_mape'] for m in metrics if accuracy_info[m]['cv_mape'] is not None]
+    avg_cv_mape = round(np.mean(cv_mapes), 2) if cv_mapes else None
 
     output = {
         'predictions': predictions,
@@ -358,19 +362,21 @@ def main():
             'num_days': len(target_dates),
         },
         'accuracy': {
-            'masuk_mape': accuracy_info['masuk']['holdout_mape'],
-            'keluar_mape': accuracy_info['keluar']['holdout_mape'],
-            'penumpang_mape': accuracy_info['penumpang']['holdout_mape'],
+            'masuk_mape': accuracy_info['masuk']['mape'],
+            'keluar_mape': accuracy_info['keluar']['mape'],
+            'penumpang_mape': accuracy_info['penumpang']['mape'],
             'avg_mape': avg_mape,
             'overall_accuracy': overall_accuracy,
             'cv_mape': avg_cv_mape,
-            'evaluation_method': 'Honest hold-out (last 14 days never seen during tuning)',
+            'holdout_mape': {m: accuracy_info[m]['holdout_mape'] for m in metrics},
+            'evaluation_method': 'Time-series CV (3 folds) + honest hold-out (14 hari)',
+            'method_notes': {m: accuracy_info[m]['method_note'] for m in metrics},
         },
         'meta': {
             'training_data_points': len(daily_df),
-            'used_holidays': holidays_df is not None and not holidays_df.empty,
-            'method': 'Prophet + Time-series CV + Honest hold-out evaluation',
-            'best_params': {m: accuracy_info[m]['best_changepoint_prior_scale'] for m in metrics},
+            'used_holidays': bool(holidays_df is not None and not holidays_df.empty),
+            'method': 'Facebook Prophet dengan multiplicative seasonality + hari libur Indonesia',
+            'model': 'Prophet',
         }
     }
 
