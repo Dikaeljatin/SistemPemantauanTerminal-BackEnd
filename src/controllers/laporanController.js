@@ -1,4 +1,5 @@
 const pool = require('../config/db');
+const { logActivity } = require('./activityController');
 
 // POST /api/laporan — Kirim laporan baru
 exports.createLaporan = async (req, res) => {
@@ -29,6 +30,14 @@ exports.createLaporan = async (req, res) => {
         total_keberangkatan || 0,
         total_penumpang || 0,
       ]
+    );
+
+    // Log aktivitas
+    await logActivity(
+      petugas_nama || 'Petugas',
+      'kirim',
+      `Kirim laporan periode ${periode}`,
+      `Total kendaraan: ${total_kendaraan || 0}, Penumpang: ${total_penumpang || 0}`
     );
 
     res.status(201).json({
