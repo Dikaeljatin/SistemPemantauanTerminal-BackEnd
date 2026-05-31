@@ -13,6 +13,15 @@ app.get('/', (req, res) => {
   res.json({ message: 'Monitoring System API is running' });
 });
 
+// Health check endpoint untuk keep-alive
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+  });
+});
+
 // API Routes
 const pergerakanRoutes = require('./routes/pergerakanRoutes');
 app.use('/api/pergerakan', pergerakanRoutes);

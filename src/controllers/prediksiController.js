@@ -43,7 +43,9 @@ exports.predict = async (req, res) => {
 
     // Spawn Python script
     const scriptPath = path.join(__dirname, '..', 'python', 'predict.py');
-    const py = spawn('python', [scriptPath]);
+    // Pakai PYTHON_PATH dari env, fallback ke 'python3' (Linux/Render) atau 'python' (Windows)
+    const pythonCmd = process.env.PYTHON_PATH || (process.platform === 'win32' ? 'python' : 'python3');
+    const py = spawn(pythonCmd, [scriptPath]);
 
     let output = '';
     let errorOutput = '';
