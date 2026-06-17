@@ -1,28 +1,16 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+const { requireAuth, requireRole } = require('../middleware/auth');
 const { createPergerakan, getAllPergerakan, deletePergerakan, updatePergerakan, downloadTemplate, importExcel, exportExcel } = require('../controllers/pergerakanController');
 
-// GET /api/pergerakan/template — Download template Excel untuk import
-router.get('/template', downloadTemplate);
-
-// GET /api/pergerakan/export — Export semua data ke Excel
-router.get('/export', exportExcel);
-
-// POST /api/pergerakan/import — Import data dari file Excel
-router.post('/import', upload.single('file'), importExcel);
-
-// POST /api/pergerakan — Simpan data pergerakan
-router.post('/', createPergerakan);
-
-// GET /api/pergerakan — Ambil semua data pergerakan
-router.get('/', getAllPergerakan);
-
-// DELETE /api/pergerakan/:id — Hapus data pergerakan
-router.delete('/:id', deletePergerakan);
-
-// PUT /api/pergerakan/:id — Update data pergerakan
-router.put('/:id', updatePergerakan);
+router.get('/template', requireAuth, downloadTemplate);
+router.get('/export', requireAuth, exportExcel);
+router.post('/import', requireAuth, requireRole('petugas', 'super_admin'), upload.single('file'), importExcel);
+router.post('/', requireAuth, requireRole('petugas', 'super_admin'), createPergerakan);
+router.get('/', getAllPergerakan); // publik — data jadwal terminal bisa dilihat tanpa login
+router.delete('/:id', requireAuth, requireRole('petugas', 'super_admin'), deletePergerakan);
+router.put('/:id', requireAuth, requireRole('petugas', 'super_admin'), updatePergerakan);
 
 module.exports = router;

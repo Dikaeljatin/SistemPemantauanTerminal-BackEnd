@@ -1,4 +1,7 @@
 const pool = require('../config/db');
+const bcrypt = require('bcryptjs');
+
+const SALT_ROUNDS = 10;
 
 // GET /api/users — Ambil semua user
 exports.getAllUsers = async (req, res) => {
@@ -20,9 +23,10 @@ exports.createUser = async (req, res) => {
     if (!nama || !username || !password || !role) {
       return res.status(400).json({ error: 'Field wajib tidak lengkap' });
     }
+    const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
     const result = await pool.query(
       'INSERT INTO users (nama, email, username, password, role) VALUES ($1, $2, $3, $4, $5) RETURNING user_id, nama, email, username, role',
-      [nama, email || null, username, password, role]
+      [nama, email || null, username, hashedPassword, role]
     );
     res.status(201).json({ message: 'User berhasil ditambahkan', data: result.rows[0] });
   } catch (error) {
@@ -41,8 +45,9 @@ exports.updateUser = async (req, res) => {
     const { nama, email, username, password, role, status } = req.body;
     let query, params;
     if (password) {
+      const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
       query = 'UPDATE users SET nama=$1, email=$2, username=$3, password=$4, role=$5, status=$6 WHERE user_id=$7 RETURNING user_id, nama, email, username, role, status';
-      params = [nama, email || null, username, password, role, status || 'aktif', id];
+      params = [nama, email || null, username, hashedPassword, role, status || 'aktif', id];
     } else {
       query = 'UPDATE users SET nama=$1, email=$2, username=$3, role=$4, status=$5 WHERE user_id=$6 RETURNING user_id, nama, email, username, role, status';
       params = [nama, email || null, username, role, status || 'aktif', id];

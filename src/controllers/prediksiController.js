@@ -56,7 +56,7 @@ exports.predict = async (req, res) => {
     py.on('close', (code) => {
       if (code !== 0) {
         console.error('Python error:', errorOutput);
-        return res.status(500).json({ error: 'Gagal menjalankan prediksi: ' + errorOutput });
+        return res.status(500).json({ error: 'Gagal menjalankan prediksi. Silakan coba lagi' });
       }
 
       try {

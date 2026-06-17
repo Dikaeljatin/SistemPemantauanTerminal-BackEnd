@@ -465,31 +465,105 @@ exports.createPergerakan = async (req, res) => {
   }
 };
 
-// GET /api/pergerakan — Ambil semua data pergerakan dengan join kendaraan & perusahaan
+// GET /api/pergerakan — Ambil data pergerakan, mendukung server-side pagination + filter
+// Query params:
+//   page, limit          → aktifkan pagination (tanpa page = ambil semua, untuk chart)
+//   filter_mode          → "harian" | "bulanan"
+//   tanggal              → YYYY-MM-DD (untuk harian)
+//   bulan                → 1-12 (untuk bulanan, 0 = semua bulan)
+//   tahun                → angka tahun
+//   status               → "kedatangan" | "keberangkatan"
+//   search               → pencarian TNKB / trayek / perusahaan
 exports.getAllPergerakan = async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT 
-        dp.pergerakan_id,
-        dp."timestamp",
-        dp.status_pergerakan,
-        dp.jumlah_penumpang,
-        dp.trayek_asal,
-        dp.trayek_tujuan,
-        dp.created_by,
-        dp.updated_by,
-        dp.created_at,
-        dp.updated_at,
-        k.tnkb,
-        k.jenis_kendaraan,
-        k.kapasitas_mobil,
-        p.nama_perusahaan
+    const { page, limit = 20, filter_mode, bulan, tahun, tanggal, status, search } = req.query;
+
+    const conditions = [];
+    const params = [];
+
+    // Filter tanggal
+    if (filter_mode === 'harian' && tanggal) {
+      params.push(`${tanggal} 00:00:00`, `${tanggal} 23:59:59`);
+      conditions.push(`dp."timestamp" >= $${params.length - 1}::timestamp AND dp."timestamp" <= $${params.length}::timestamp`);
+    } else if (filter_mode === 'bulanan' && tahun) {
+      const bulanNum = bulan && bulan !== '0' ? String(parseInt(bulan)).padStart(2, '0') : null;
+      if (bulanNum) {
+        const lastDay = new Date(parseInt(tahun), parseInt(bulan), 0).getDate();
+        params.push(`${tahun}-${bulanNum}-01 00:00:00`, `${tahun}-${bulanNum}-${String(lastDay).padStart(2,'0')} 23:59:59`);
+      } else {
+        params.push(`${tahun}-01-01 00:00:00`, `${tahun}-12-31 23:59:59`);
+      }
+      conditions.push(`dp."timestamp" >= $${params.length - 1}::timestamp AND dp."timestamp" <= $${params.length}::timestamp`);
+    }
+
+    // Filter status
+    if (status && (status === 'kedatangan' || status === 'keberangkatan')) {
+      params.push(status);
+      conditions.push(`dp.status_pergerakan = $${params.length}`);
+    }
+
+    // Filter pencarian
+    if (search && search.trim()) {
+      params.push(`%${search.trim()}%`);
+      const si = params.length;
+      conditions.push(`(k.tnkb ILIKE $${si} OR dp.trayek_asal ILIKE $${si} OR dp.trayek_tujuan ILIKE $${si} OR p.nama_perusahaan ILIKE $${si})`);
+    }
+
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const selectFields = `
+      dp.pergerakan_id,
+      dp."timestamp",
+      dp.status_pergerakan,
+      dp.jumlah_penumpang,
+      dp.trayek_asal,
+      dp.trayek_tujuan,
+      dp.created_by,
+      dp.updated_by,
+      dp.created_at,
+      dp.updated_at,
+      k.tnkb,
+      k.jenis_kendaraan,
+      k.kapasitas_mobil,
+      p.nama_perusahaan
+    `;
+
+    const baseFrom = `
       FROM data_pergerakan dp
       LEFT JOIN kendaraan k ON dp.kendaraan_id = k.kendaraan_id
       LEFT JOIN perusahaan p ON k.perusahaan_id = p.perusahaan_id
-      ORDER BY dp."timestamp" DESC
-    `);
+      ${whereClause}
+    `;
 
+    if (page !== undefined) {
+      // Server-side pagination
+      const pageNum = Math.max(1, parseInt(page) || 1);
+      const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 20));
+      const offset = (pageNum - 1) * limitNum;
+
+      const countResult = await pool.query(`SELECT COUNT(*) ${baseFrom}`, params);
+      const total = parseInt(countResult.rows[0].count);
+
+      const dataParams = [...params, limitNum, offset];
+      const dataResult = await pool.query(
+        `SELECT ${selectFields} ${baseFrom} ORDER BY dp."timestamp" DESC LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
+        dataParams
+      );
+
+      return res.json({
+        data: dataResult.rows,
+        total,
+        page: pageNum,
+        totalPages: Math.ceil(total / limitNum),
+        limit: limitNum,
+      });
+    }
+
+    // Tanpa page → ambil semua (dipakai chart)
+    const result = await pool.query(
+      `SELECT ${selectFields} ${baseFrom} ORDER BY dp."timestamp" DESC`,
+      params
+    );
     res.json({ data: result.rows });
   } catch (error) {
     console.error('Error getAllPergerakan:', error);
