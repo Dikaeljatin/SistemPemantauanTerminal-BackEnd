@@ -465,6 +465,60 @@ exports.createPergerakan = async (req, res) => {
   }
 };
 
+// Membangun WHERE conditions + params dari query filter yang dipakai bersama
+// oleh getAllPergerakan dan getSummary, supaya logikanya tidak duplikat.
+function buildFilterConditions(query) {
+  const { filter_mode, bulan, tahun, tanggal, status, search } = query;
+  const conditions = [];
+  const params = [];
+
+  // Filter tanggal
+  if (filter_mode === 'harian' && tanggal) {
+    params.push(`${tanggal} 00:00:00`, `${tanggal} 23:59:59`);
+    conditions.push(`dp."timestamp" >= $${params.length - 1}::timestamp AND dp."timestamp" <= $${params.length}::timestamp`);
+  } else if (filter_mode === 'bulanan' && tahun) {
+    const bulanNum = bulan && bulan !== '0' ? String(parseInt(bulan)).padStart(2, '0') : null;
+    if (bulanNum) {
+      const lastDay = new Date(parseInt(tahun), parseInt(bulan), 0).getDate();
+      params.push(`${tahun}-${bulanNum}-01 00:00:00`, `${tahun}-${bulanNum}-${String(lastDay).padStart(2,'0')} 23:59:59`);
+    } else {
+      params.push(`${tahun}-01-01 00:00:00`, `${tahun}-12-31 23:59:59`);
+    }
+    conditions.push(`dp."timestamp" >= $${params.length - 1}::timestamp AND dp."timestamp" <= $${params.length}::timestamp`);
+  }
+
+  // Filter status
+  if (status && (status === 'kedatangan' || status === 'keberangkatan')) {
+    params.push(status);
+    conditions.push(`dp.status_pergerakan = $${params.length}`);
+  }
+
+  // Filter pencarian
+  if (search && search.trim()) {
+    params.push(`%${search.trim()}%`);
+    const si = params.length;
+    conditions.push(`(k.tnkb ILIKE $${si} OR k.jenis_kendaraan ILIKE $${si} OR dp.trayek_asal ILIKE $${si} OR dp.trayek_tujuan ILIKE $${si} OR p.nama_perusahaan ILIKE $${si})`);
+  }
+
+  return { conditions, params };
+}
+
+function toWhere(conditions) {
+  return conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+}
+
+// Kolom yang boleh dipakai untuk sorting tabel (whitelist, mencegah SQL injection lewat nama kolom)
+const SORTABLE_COLUMNS = {
+  waktu: 'dp."timestamp"',
+  tnkb: 'k.tnkb',
+  jenis: 'k.jenis_kendaraan',
+  status: 'dp.status_pergerakan',
+  penumpang: 'dp.jumlah_penumpang',
+  trayekAsal: 'dp.trayek_asal',
+  trayekTujuan: 'dp.trayek_tujuan',
+  perusahaan: 'p.nama_perusahaan',
+};
+
 // GET /api/pergerakan — Ambil data pergerakan, mendukung server-side pagination + filter
 // Query params:
 //   page, limit          → aktifkan pagination (tanpa page = ambil semua, untuk chart)
@@ -473,43 +527,15 @@ exports.createPergerakan = async (req, res) => {
 //   bulan                → 1-12 (untuk bulanan, 0 = semua bulan)
 //   tahun                → angka tahun
 //   status               → "kedatangan" | "keberangkatan"
-//   search               → pencarian TNKB / trayek / perusahaan
+//   search               → pencarian TNKB / jenis / trayek / perusahaan
+//   sort_key, sort_dir   → kolom & arah sorting tabel (lihat SORTABLE_COLUMNS)
 exports.getAllPergerakan = async (req, res) => {
   try {
-    const { page, limit = 20, filter_mode, bulan, tahun, tanggal, status, search } = req.query;
-
-    const conditions = [];
-    const params = [];
-
-    // Filter tanggal
-    if (filter_mode === 'harian' && tanggal) {
-      params.push(`${tanggal} 00:00:00`, `${tanggal} 23:59:59`);
-      conditions.push(`dp."timestamp" >= $${params.length - 1}::timestamp AND dp."timestamp" <= $${params.length}::timestamp`);
-    } else if (filter_mode === 'bulanan' && tahun) {
-      const bulanNum = bulan && bulan !== '0' ? String(parseInt(bulan)).padStart(2, '0') : null;
-      if (bulanNum) {
-        const lastDay = new Date(parseInt(tahun), parseInt(bulan), 0).getDate();
-        params.push(`${tahun}-${bulanNum}-01 00:00:00`, `${tahun}-${bulanNum}-${String(lastDay).padStart(2,'0')} 23:59:59`);
-      } else {
-        params.push(`${tahun}-01-01 00:00:00`, `${tahun}-12-31 23:59:59`);
-      }
-      conditions.push(`dp."timestamp" >= $${params.length - 1}::timestamp AND dp."timestamp" <= $${params.length}::timestamp`);
-    }
-
-    // Filter status
-    if (status && (status === 'kedatangan' || status === 'keberangkatan')) {
-      params.push(status);
-      conditions.push(`dp.status_pergerakan = $${params.length}`);
-    }
-
-    // Filter pencarian
-    if (search && search.trim()) {
-      params.push(`%${search.trim()}%`);
-      const si = params.length;
-      conditions.push(`(k.tnkb ILIKE $${si} OR dp.trayek_asal ILIKE $${si} OR dp.trayek_tujuan ILIKE $${si} OR p.nama_perusahaan ILIKE $${si})`);
-    }
-
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const { page, limit = 20, sort_key, sort_dir } = req.query;
+    const { conditions, params } = buildFilterConditions(req.query);
+    const whereClause = toWhere(conditions);
+    const sortColumn = SORTABLE_COLUMNS[sort_key] || 'dp."timestamp"';
+    const sortDirection = sort_dir === 'asc' ? 'ASC' : 'DESC';
 
     const selectFields = `
       dp.pergerakan_id,
@@ -546,7 +572,7 @@ exports.getAllPergerakan = async (req, res) => {
 
       const dataParams = [...params, limitNum, offset];
       const dataResult = await pool.query(
-        `SELECT ${selectFields} ${baseFrom} ORDER BY dp."timestamp" DESC LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
+        `SELECT ${selectFields} ${baseFrom} ORDER BY ${sortColumn} ${sortDirection} LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
         dataParams
       );
 
@@ -559,15 +585,144 @@ exports.getAllPergerakan = async (req, res) => {
       });
     }
 
-    // Tanpa page → ambil semua (dipakai chart)
+    // Tanpa page → ambil semua (dipakai untuk export/import, bukan chart — chart pakai /summary)
     const result = await pool.query(
-      `SELECT ${selectFields} ${baseFrom} ORDER BY dp."timestamp" DESC`,
+      `SELECT ${selectFields} ${baseFrom} ORDER BY ${sortColumn} ${sortDirection}`,
       params
     );
     res.json({ data: result.rows });
   } catch (error) {
     console.error('Error getAllPergerakan:', error);
     res.status(500).json({ error: 'Gagal mengambil data pergerakan' });
+  }
+};
+
+// GET /api/pergerakan/summary — Agregat untuk grafik (SQL GROUP BY di server),
+// supaya frontend tidak perlu fetch seluruh baris pergerakan hanya untuk hitung chart.
+// Menerima query filter yang sama dengan getAllPergerakan (filter_mode, tanggal, bulan, tahun, status, search).
+exports.getSummary = async (req, res) => {
+  try {
+    const { conditions, params } = buildFilterConditions(req.query);
+    const baseJoins = `
+      FROM data_pergerakan dp
+      LEFT JOIN kendaraan k ON dp.kendaraan_id = k.kendaraan_id
+      LEFT JOIN perusahaan p ON k.perusahaan_id = p.perusahaan_id
+    `;
+    const where = toWhere(conditions);
+    const whereWith = (extra) => toWhere([...conditions, ...extra]);
+
+    const [
+      totals,
+      byJenis,
+      byTrayekAsal,
+      byTrayekTujuan,
+      byPerusahaan,
+      byJam,
+      byTnkbKeberangkatan,
+      byTnkbKedatangan,
+      penumpangPerJenis,
+    ] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*) AS total,
+          COUNT(*) FILTER (WHERE dp.status_pergerakan = 'kedatangan') AS total_kedatangan,
+          COUNT(*) FILTER (WHERE dp.status_pergerakan = 'keberangkatan') AS total_keberangkatan,
+          COALESCE(SUM(dp.jumlah_penumpang) FILTER (WHERE dp.status_pergerakan = 'kedatangan'), 0) AS total_penumpang_datang,
+          COALESCE(SUM(dp.jumlah_penumpang) FILTER (WHERE dp.status_pergerakan = 'keberangkatan'), 0) AS total_penumpang_berangkat
+        ${baseJoins} ${where}
+      `, params),
+
+      pool.query(`
+        SELECT COALESCE(k.jenis_kendaraan, '') AS name, COUNT(*) AS value
+        ${baseJoins} ${where}
+        GROUP BY k.jenis_kendaraan
+        ORDER BY value DESC
+      `, params),
+
+      pool.query(`
+        SELECT dp.trayek_asal AS name, COUNT(*) AS value
+        ${baseJoins} ${whereWith([`dp.trayek_asal IS NOT NULL AND dp.trayek_asal != ''`])}
+        GROUP BY dp.trayek_asal
+        ORDER BY value DESC
+        LIMIT 6
+      `, params),
+
+      pool.query(`
+        SELECT dp.trayek_tujuan AS name, COUNT(*) AS value
+        ${baseJoins} ${whereWith([`dp.trayek_tujuan IS NOT NULL AND dp.trayek_tujuan != ''`])}
+        GROUP BY dp.trayek_tujuan
+        ORDER BY value DESC
+        LIMIT 6
+      `, params),
+
+      pool.query(`
+        SELECT p.nama_perusahaan AS name, COUNT(*) AS value
+        ${baseJoins} ${whereWith([`p.nama_perusahaan IS NOT NULL AND p.nama_perusahaan != '' AND p.nama_perusahaan != '-'`])}
+        GROUP BY p.nama_perusahaan
+        ORDER BY value DESC
+        LIMIT 6
+      `, params),
+
+      pool.query(`
+        SELECT
+          LPAD(EXTRACT(HOUR FROM dp."timestamp")::text, 2, '0') || ':00' AS jam,
+          COUNT(*) FILTER (WHERE dp.status_pergerakan = 'kedatangan') AS masuk,
+          COUNT(*) FILTER (WHERE dp.status_pergerakan = 'keberangkatan') AS keluar,
+          COALESCE(SUM(dp.jumlah_penumpang) FILTER (WHERE dp.status_pergerakan = 'kedatangan'), 0) AS datang,
+          COALESCE(SUM(dp.jumlah_penumpang) FILTER (WHERE dp.status_pergerakan = 'keberangkatan'), 0) AS berangkat
+        ${baseJoins} ${where}
+        GROUP BY 1
+        ORDER BY 1
+      `, params),
+
+      pool.query(`
+        SELECT k.tnkb AS name, k.jenis_kendaraan AS jenis, COUNT(*) AS value
+        ${baseJoins} ${whereWith([`dp.status_pergerakan = 'keberangkatan'`, `k.tnkb IS NOT NULL AND k.tnkb != ''`])}
+        GROUP BY k.tnkb, k.jenis_kendaraan
+        ORDER BY value DESC
+        LIMIT 5
+      `, params),
+
+      pool.query(`
+        SELECT k.tnkb AS name, k.jenis_kendaraan AS jenis, COUNT(*) AS value
+        ${baseJoins} ${whereWith([`dp.status_pergerakan = 'kedatangan'`, `k.tnkb IS NOT NULL AND k.tnkb != ''`])}
+        GROUP BY k.tnkb, k.jenis_kendaraan
+        ORDER BY value DESC
+        LIMIT 5
+      `, params),
+
+      pool.query(`
+        SELECT COALESCE(k.jenis_kendaraan, '') AS name, ROUND(AVG(dp.jumlah_penumpang)) AS value
+        ${baseJoins} ${where}
+        GROUP BY k.jenis_kendaraan
+      `, params),
+    ]);
+
+    const toNum = (rows, intFields) => rows.map((r) => {
+      const o = { ...r };
+      intFields.forEach((f) => { o[f] = parseInt(o[f], 10) || 0; });
+      return o;
+    });
+
+    const t = totals.rows[0];
+    res.json({
+      total: parseInt(t.total, 10) || 0,
+      totalKedatangan: parseInt(t.total_kedatangan, 10) || 0,
+      totalKeberangkatan: parseInt(t.total_keberangkatan, 10) || 0,
+      totalPenumpangDatang: parseInt(t.total_penumpang_datang, 10) || 0,
+      totalPenumpangBerangkat: parseInt(t.total_penumpang_berangkat, 10) || 0,
+      byJenis: toNum(byJenis.rows, ['value']),
+      byTrayekAsal: toNum(byTrayekAsal.rows, ['value']),
+      byTrayekTujuan: toNum(byTrayekTujuan.rows, ['value']),
+      byPerusahaan: toNum(byPerusahaan.rows, ['value']),
+      byJam: toNum(byJam.rows, ['masuk', 'keluar', 'datang', 'berangkat']),
+      byTnkbKeberangkatan: toNum(byTnkbKeberangkatan.rows, ['value']),
+      byTnkbKedatangan: toNum(byTnkbKedatangan.rows, ['value']),
+      penumpangPerJenis: toNum(penumpangPerJenis.rows, ['value']),
+    });
+  } catch (error) {
+    console.error('Error getSummary:', error);
+    res.status(500).json({ error: 'Gagal mengambil ringkasan data pergerakan' });
   }
 };
 
