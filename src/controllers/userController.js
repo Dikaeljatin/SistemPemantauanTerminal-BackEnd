@@ -16,6 +16,46 @@ exports.getAllUsers = async (req, res) => {
   }
 };
 
+// GET /api/users/me — Ambil profil sendiri (semua role yang login)
+exports.getMyProfile = async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT user_id, nama, email, username, role, status, created_at FROM users WHERE user_id = $1',
+      [req.user.user_id]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User tidak ditemukan' });
+    res.json({ data: result.rows[0] });
+  } catch (error) {
+    console.error('Error getMyProfile:', error);
+    res.status(500).json({ error: 'Gagal mengambil profil' });
+  }
+};
+
+// PUT /api/users/me — Update profil sendiri (nama, email, password saja — role & status tidak bisa diubah sendiri)
+exports.updateMyProfile = async (req, res) => {
+  try {
+    const { nama, email, password } = req.body;
+    let query, params;
+    if (password) {
+      const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
+      query = 'UPDATE users SET nama=$1, email=$2, password=$3 WHERE user_id=$4 RETURNING user_id, nama, email, username, role, status';
+      params = [nama, email || null, hashedPassword, req.user.user_id];
+    } else {
+      query = 'UPDATE users SET nama=$1, email=$2 WHERE user_id=$3 RETURNING user_id, nama, email, username, role, status';
+      params = [nama, email || null, req.user.user_id];
+    }
+    const result = await pool.query(query, params);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'User tidak ditemukan' });
+    res.json({ message: 'Profil berhasil diupdate', data: result.rows[0] });
+  } catch (error) {
+    console.error('Error updateMyProfile:', error);
+    if (error.code === '23505') {
+      return res.status(400).json({ error: 'Email sudah digunakan' });
+    }
+    res.status(500).json({ error: 'Gagal update profil' });
+  }
+};
+
 // POST /api/users — Tambah user baru
 exports.createUser = async (req, res) => {
   try {
