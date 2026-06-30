@@ -11,6 +11,14 @@ exports.predict = async (req, res) => {
       return res.status(400).json({ error: 'Tanggal mulai dan akhir wajib diisi' });
     }
 
+    const diffDays = Math.round((new Date(tanggal_akhir) - new Date(tanggal_mulai)) / (1000 * 60 * 60 * 24));
+    if (diffDays < 0) {
+      return res.status(400).json({ error: 'Tanggal akhir tidak boleh sebelum tanggal mulai' });
+    }
+    if (diffDays > 30) {
+      return res.status(400).json({ error: 'Rentang prediksi maksimal 30 hari (1 bulan)' });
+    }
+
     // Fetch historical data from database
     // Aggregate per hour: count masuk (kedatangan), keluar (keberangkatan), and total penumpang
     const result = await pool.query(`
