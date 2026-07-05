@@ -5,6 +5,37 @@ const path = require('path');
 
 const PREDICT_PORT = process.env.PREDICT_PORT || 5001;
 
+// Fallback: jalankan prediksi via subprocess spawn (dipakai jika Flask tidak tersedia)
+function runViaSpawn(input, res) {
+  const scriptPath = path.join(__dirname, '..', 'python', 'predict.py');
+  const pythonCmd = process.env.PYTHON_PATH || (process.platform === 'win32' ? 'python' : 'python3');
+  const py = spawn(pythonCmd, [scriptPath]);
+
+  let output = '';
+  let errorOutput = '';
+
+  py.stdout.on('data', (d) => { output += d.toString(); });
+  py.stderr.on('data', (d) => { errorOutput += d.toString(); });
+
+  py.on('close', (code) => {
+    if (code !== 0) {
+      console.error('Python spawn error:', errorOutput);
+      return res.status(500).json({ error: 'Gagal menjalankan prediksi. Silakan coba lagi.' });
+    }
+    try {
+      const result = JSON.parse(output);
+      if (result.error) return res.status(500).json({ error: result.error });
+      res.json(result);
+    } catch (parseErr) {
+      console.error('Parse error (spawn):', parseErr);
+      res.status(500).json({ error: 'Gagal parse hasil prediksi' });
+    }
+  });
+
+  py.stdin.write(JSON.stringify(input));
+  py.stdin.end();
+}
+
 // POST /api/prediksi — Prediksi pergerakan kendaraan menggunakan Prophet
 exports.predict = async (req, res) => {
   try {
@@ -117,8 +148,9 @@ exports.predict = async (req, res) => {
     });
 
     httpReq.on('error', (e) => {
-      console.error('Flask server tidak tersedia:', e.message);
-      res.status(503).json({ error: 'Layanan prediksi sedang tidak tersedia. Coba beberapa saat lagi.' });
+      // Flask belum siap atau tidak tersedia — fallback ke spawn subprocess
+      console.warn('Flask tidak tersedia, fallback ke spawn:', e.message);
+      runViaSpawn(input, res);
     });
 
     httpReq.write(postData);
