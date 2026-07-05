@@ -97,18 +97,38 @@ def remove_outliers_iqr(series, multiplier=3.0):
     return series.clip(lower=lower, upper=upper)
 
 
-def fill_missing_dates(df, date_col='ds', value_cols=None):
-    """Isi tanggal kosong dengan 0 (count data)."""
+def fill_missing_dates(df, date_col='ds', value_cols=None, max_gap_to_fill=30):
+    """Isi tanggal kosong dengan 0, tapi ABAIKAN gap besar > max_gap_to_fill hari.
+    Gap besar (misal 15 bulan tanpa data) tidak diisi 0 agar tidak merusak model."""
     if value_cols is None:
         value_cols = [c for c in df.columns if c != date_col]
     df[date_col] = pd.to_datetime(df[date_col])
-    full_range = pd.date_range(start=df[date_col].min(), end=df[date_col].max(), freq='D')
-    full_df = pd.DataFrame({date_col: full_range})
-    df = full_df.merge(df, on=date_col, how='left')
-    for col in value_cols:
-        if col in df.columns:
-            df[col] = df[col].fillna(0).astype(int)
-    return df
+    df = df.sort_values(date_col).reset_index(drop=True)
+
+    # Pisahkan data menjadi segmen-segmen berdasarkan gap besar
+    segments = []
+    seg_start = 0
+    for i in range(1, len(df)):
+        gap_days = (df[date_col].iloc[i] - df[date_col].iloc[i - 1]).days
+        if gap_days > max_gap_to_fill:
+            segments.append(df.iloc[seg_start:i])
+            seg_start = i
+    segments.append(df.iloc[seg_start:])
+
+    # Isi gap kecil dalam setiap segmen dengan 0
+    filled = []
+    for seg in segments:
+        if len(seg) == 0:
+            continue
+        seg_range = pd.date_range(start=seg[date_col].min(), end=seg[date_col].max(), freq='D')
+        full_seg = pd.DataFrame({date_col: seg_range})
+        seg = full_seg.merge(seg, on=date_col, how='left')
+        for col in value_cols:
+            if col in seg.columns:
+                seg[col] = seg[col].fillna(0).astype(int)
+        filled.append(seg)
+
+    return pd.concat(filled, ignore_index=True) if filled else df
 
 
 def aggregate_to_daily(history):
@@ -149,7 +169,7 @@ def fit_prophet(train_df, holidays_df, has_yearly):
         'yearly_seasonality': has_yearly,
         'changepoint_prior_scale': 0.05,
         'seasonality_prior_scale': 10.0,
-        'seasonality_mode': 'multiplicative',  # Cocok untuk count data
+        'seasonality_mode': 'additive',  # Lebih stabil untuk count data kecil/sparse
         'interval_width': 0.80,
     }
     if holidays_df is not None and not holidays_df.empty:
@@ -220,17 +240,32 @@ def time_series_cv_evaluate(df, target_col, holidays_df, has_yearly, n_folds=3):
 
 # ==================== MAIN ====================
 
-def main():
-    input_data = json.loads(sys.stdin.read())
-    history = input_data['history']
-    tanggal_mulai = input_data['tanggal_mulai']
-    tanggal_akhir = input_data['tanggal_akhir']
+def run_prediction(input_data):
+    """Core prediction logic. Returns dict result (bisa dipanggil dari Flask atau stdin)."""
+    daily_history      = input_data['daily_history']
+    hourly_pattern_raw = input_data.get('hourly_pattern', {})
+    tanggal_mulai      = input_data['tanggal_mulai']
+    tanggal_akhir      = input_data['tanggal_akhir']
 
-    daily_df, hourly_pattern = aggregate_to_daily(history)
+    # Build daily DataFrame langsung dari SQL result (tidak perlu re-agregasi di Python)
+    daily_df = pd.DataFrame(daily_history)
+    daily_df['ds'] = pd.to_datetime(daily_df['ds'])
+    daily_df = fill_missing_dates(daily_df, 'ds', ['masuk', 'keluar', 'penumpang'])
 
     if len(daily_df) < 60:
-        print(json.dumps({'error': 'Data harian tidak cukup (minimal 60 hari)'}))
-        sys.exit(0)
+        return {'error': 'Data harian tidak cukup (minimal 60 hari)'}
+
+    # Normalisasi pola distribusi per jam dari SQL result
+    # hourly_pattern_raw: { "0": {masuk, keluar, penumpang}, ..., "23": {...} }
+    hourly_pattern = {}
+    for col in ['masuk', 'keluar', 'penumpang']:
+        raw = {h: float((hourly_pattern_raw.get(str(h)) or hourly_pattern_raw.get(h) or {}).get(col, 0))
+               for h in range(24)}
+        total = sum(raw.values())
+        if total > 0:
+            hourly_pattern[col] = {h: v / total for h, v in raw.items()}
+        else:
+            hourly_pattern[col] = {h: 1 / 24 for h in range(24)}
 
     # Build target dates
     start = datetime.strptime(tanggal_mulai, '%Y-%m-%d')
@@ -380,7 +415,14 @@ def main():
         }
     }
 
-    print(json.dumps(output))
+    return output
+
+
+def main():
+    """Stdin/stdout mode — dipakai saat dipanggil langsung via subprocess (fallback)."""
+    input_data = json.loads(sys.stdin.read())
+    result = run_prediction(input_data)
+    print(json.dumps(result))
 
 
 if __name__ == '__main__':

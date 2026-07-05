@@ -1,6 +1,9 @@
 const pool = require('../config/db');
+const http = require('http');
 const { spawn } = require('child_process');
 const path = require('path');
+
+const PREDICT_PORT = process.env.PREDICT_PORT || 5001;
 
 // POST /api/prediksi — Prediksi pergerakan kendaraan menggunakan Prophet
 exports.predict = async (req, res) => {
@@ -19,74 +22,107 @@ exports.predict = async (req, res) => {
       return res.status(400).json({ error: 'Rentang prediksi maksimal 30 hari (1 bulan)' });
     }
 
-    // Fetch historical data from database
-    // Aggregate per hour: count masuk (kedatangan), keluar (keberangkatan), and total penumpang
-    const result = await pool.query(`
-      SELECT 
-        date_trunc('hour', "timestamp") as hour_ts,
-        SUM(CASE WHEN status_pergerakan = 'kedatangan' THEN 1 ELSE 0 END) as masuk,
-        SUM(CASE WHEN status_pergerakan = 'keberangkatan' THEN 1 ELSE 0 END) as keluar,
-        COALESCE(SUM(jumlah_penumpang), 0) as penumpang
-      FROM data_pergerakan
-      WHERE "timestamp" IS NOT NULL
-      GROUP BY date_trunc('hour', "timestamp")
-      ORDER BY hour_ts ASC
-    `);
+    // Dua query paralel: data harian + pola distribusi per jam
+    // Jauh lebih efisien vs satu query per-jam (~25.000 baris) — SQL sudah agregasi
+    const [dailyResult, hourlyResult] = await Promise.all([
+      pool.query(`
+        SELECT
+          date_trunc('day', "timestamp")::date                                  AS day_ts,
+          SUM(CASE WHEN status_pergerakan = 'kedatangan'   THEN 1 ELSE 0 END)  AS masuk,
+          SUM(CASE WHEN status_pergerakan = 'keberangkatan' THEN 1 ELSE 0 END) AS keluar,
+          COALESCE(SUM(jumlah_penumpang), 0)                                    AS penumpang
+        FROM data_pergerakan
+        WHERE "timestamp" IS NOT NULL
+        GROUP BY date_trunc('day', "timestamp")::date
+        ORDER BY day_ts ASC
+      `),
+      pool.query(`
+        SELECT
+          sub.hour,
+          AVG(sub.hour_masuk)     AS masuk,
+          AVG(sub.hour_keluar)    AS keluar,
+          AVG(sub.hour_penumpang) AS penumpang
+        FROM (
+          SELECT
+            EXTRACT(HOUR FROM "timestamp")::int                                    AS hour,
+            SUM(CASE WHEN status_pergerakan = 'kedatangan'   THEN 1 ELSE 0 END)   AS hour_masuk,
+            SUM(CASE WHEN status_pergerakan = 'keberangkatan' THEN 1 ELSE 0 END)  AS hour_keluar,
+            COALESCE(SUM(jumlah_penumpang), 0)                                     AS hour_penumpang
+          FROM data_pergerakan
+          WHERE "timestamp" IS NOT NULL
+          GROUP BY date_trunc('hour', "timestamp"), EXTRACT(HOUR FROM "timestamp")
+        ) sub
+        GROUP BY sub.hour
+        ORDER BY sub.hour
+      `),
+    ]);
 
-    if (result.rows.length < 24) {
-      return res.status(400).json({ error: 'Data historis tidak cukup untuk prediksi (minimal 24 jam data)' });
+    if (dailyResult.rows.length < 7) {
+      return res.status(400).json({ error: 'Data historis tidak cukup untuk prediksi (minimal 7 hari data)' });
     }
 
-    const history = result.rows.map((row) => {
-      const d = new Date(row.hour_ts);
-      const pad = (n) => String(n).padStart(2, '0');
-      const ds = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:00:00`;
+    const pad = (n) => String(n).padStart(2, '0');
+
+    const daily_history = dailyResult.rows.map((row) => {
+      const d = new Date(row.day_ts);
+      const ds = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
       return {
         ds,
-        masuk: parseInt(row.masuk) || 0,
-        keluar: parseInt(row.keluar) || 0,
+        masuk:     parseInt(row.masuk)     || 0,
+        keluar:    parseInt(row.keluar)    || 0,
         penumpang: parseInt(row.penumpang) || 0,
       };
     });
 
-    // Spawn Python script
-    const scriptPath = path.join(__dirname, '..', 'python', 'predict.py');
-    // Pakai PYTHON_PATH dari env, fallback ke 'python3' (Linux/Render) atau 'python' (Windows)
-    const pythonCmd = process.env.PYTHON_PATH || (process.platform === 'win32' ? 'python' : 'python3');
-    const py = spawn(pythonCmd, [scriptPath]);
-
-    let output = '';
-    let errorOutput = '';
-
-    py.stdout.on('data', (data) => { output += data.toString(); });
-    py.stderr.on('data', (data) => { errorOutput += data.toString(); });
-
-    py.on('close', (code) => {
-      if (code !== 0) {
-        console.error('Python error:', errorOutput);
-        return res.status(500).json({ error: 'Gagal menjalankan prediksi. Silakan coba lagi' });
-      }
-
-      try {
-        const result = JSON.parse(output);
-        if (result.error) {
-          return res.status(500).json({ error: result.error });
-        }
-        res.json(result);
-      } catch (parseErr) {
-        console.error('Parse error:', parseErr, 'Output:', output);
-        res.status(500).json({ error: 'Gagal parse hasil prediksi' });
-      }
+    // Pola distribusi per jam: { "0": {masuk, keluar, penumpang}, ..., "23": {...} }
+    const hourly_pattern = {};
+    for (let h = 0; h < 24; h++) hourly_pattern[h] = { masuk: 0, keluar: 0, penumpang: 0 };
+    hourlyResult.rows.forEach((row) => {
+      const h = parseInt(row.hour);
+      hourly_pattern[h] = {
+        masuk:     parseFloat(row.masuk)     || 0,
+        keluar:    parseFloat(row.keluar)    || 0,
+        penumpang: parseFloat(row.penumpang) || 0,
+      };
     });
 
-    // Send input data to Python via stdin
-    const input = {
-      history,
-      tanggal_mulai,
-      tanggal_akhir,
+    // Kirim ke Flask prediction server via HTTP POST (tidak ada cold start)
+    const input = { daily_history, hourly_pattern, tanggal_mulai, tanggal_akhir };
+    const postData = JSON.stringify(input);
+
+    const options = {
+      hostname: '127.0.0.1',
+      port: PREDICT_PORT,
+      path: '/predict',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData),
+      },
     };
-    py.stdin.write(JSON.stringify(input));
-    py.stdin.end();
+
+    const httpReq = http.request(options, (httpRes) => {
+      let data = '';
+      httpRes.on('data', (chunk) => { data += chunk; });
+      httpRes.on('end', () => {
+        try {
+          const result = JSON.parse(data);
+          if (result.error) return res.status(500).json({ error: result.error });
+          res.json(result);
+        } catch (parseErr) {
+          console.error('Parse error:', parseErr, 'Output:', data);
+          res.status(500).json({ error: 'Gagal parse hasil prediksi' });
+        }
+      });
+    });
+
+    httpReq.on('error', (e) => {
+      console.error('Flask server tidak tersedia:', e.message);
+      res.status(503).json({ error: 'Layanan prediksi sedang tidak tersedia. Coba beberapa saat lagi.' });
+    });
+
+    httpReq.write(postData);
+    httpReq.end();
   } catch (error) {
     console.error('Error predict:', error);
     res.status(500).json({ error: 'Gagal melakukan prediksi: ' + error.message });
