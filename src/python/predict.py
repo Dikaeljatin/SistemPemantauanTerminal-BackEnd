@@ -412,13 +412,10 @@ def run_prediction(input_data):
     jam_tersibuk_masuk  = f"{max(masuk_hours,  key=masuk_hours.get):02d}:00"  if any(masuk_hours.values())  else "-"
     jam_tersibuk_keluar = f"{max(keluar_hours, key=keluar_hours.get):02d}:00" if any(keluar_hours.values()) else "-"
 
-    # Akurasi keseluruhan — tampilan pakai SMAPE, fallback ke MAPE jika SMAPE tidak tersedia
-    valid_smapes = [accuracy_info[m]['smape'] for m in metrics if accuracy_info[m]['smape'] is not None]
-    valid_mapes  = [accuracy_info[m]['mape']  for m in metrics if accuracy_info[m]['mape']  is not None]
-    avg_smape = round(np.mean(valid_smapes), 2) if valid_smapes else None
-    avg_mape  = round(np.mean(valid_mapes),  2) if valid_mapes  else None
-    display_avg = avg_smape if avg_smape is not None else avg_mape
-    overall_accuracy = round(max(0, 100 - display_avg), 2) if display_avg is not None else None
+    # Akurasi keseluruhan — pakai MAPE
+    valid_mapes = [accuracy_info[m]['mape'] for m in metrics if accuracy_info[m]['mape'] is not None]
+    avg_mape = round(np.mean(valid_mapes), 2) if valid_mapes else None
+    overall_accuracy = round(max(0, 100 - avg_mape), 2) if avg_mape is not None else None
 
     cv_mapes = [accuracy_info[m]['cv_mape'] for m in metrics if accuracy_info[m]['cv_mape'] is not None]
     avg_cv_mape = round(np.mean(cv_mapes), 2) if cv_mapes else None
@@ -435,10 +432,10 @@ def run_prediction(input_data):
             'num_days': len(target_dates),
         },
         'accuracy': {
-            'masuk_mape':     accuracy_info['masuk']['smape']     or accuracy_info['masuk']['mape'],
-            'keluar_mape':    accuracy_info['keluar']['smape']    or accuracy_info['keluar']['mape'],
-            'penumpang_mape': accuracy_info['penumpang']['smape'] or accuracy_info['penumpang']['mape'],
-            'avg_mape': display_avg,
+            'masuk_mape':     accuracy_info['masuk']['mape'],
+            'keluar_mape':    accuracy_info['keluar']['mape'],
+            'penumpang_mape': accuracy_info['penumpang']['mape'],
+            'avg_mape': avg_mape,
             'overall_accuracy': overall_accuracy,
             'cv_mape': avg_cv_mape,
             'holdout_mape': {m: accuracy_info[m]['holdout_mape'] for m in metrics},
