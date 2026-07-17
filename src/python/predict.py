@@ -330,19 +330,14 @@ def run_prediction(input_data):
                 'method_note': f'Backtesting pada {len(overlap)} hari aktual',
             }
         else:
-            # Tanggal masa depan — CV + hold-out
-            # Panjang holdout disesuaikan dengan horizon prediksi yang dipilih user
-            # agar akurasi berubah saat user memilih periode berbeda (1 minggu vs 1 bulan)
+            # Tanggal masa depan — CV + hold-out (fixed 30 hari)
             cv_mape = time_series_cv_evaluate(df_metric, metric, holidays_df, has_yearly, params, n_folds=3)
 
             n = len(df_metric)
-            pred_horizon = len(target_dates)
             holdout_mape = None
             holdout_smape = None
             if n > 30:
-                # Holdout window = panjang prediksi, minimal 7 hari, sisakan >=30 hari untuk training
-                holdout_window = max(7, min(pred_horizon, n - 30))
-                holdout_start = n - holdout_window
+                holdout_start = n - 30
                 train_for_holdout = df_metric.iloc[:holdout_start].copy()
                 holdout = df_metric.iloc[holdout_start:].copy()
                 try:
@@ -360,7 +355,7 @@ def run_prediction(input_data):
                 method_note = 'CV (hold-out menunjukkan data drift)'
             elif holdout_mape is not None:
                 primary_mape = holdout_mape
-                method_note = f'Hold-out ({holdout_window} hari terakhir)'
+                method_note = 'Hold-out (30 hari terakhir)'
             elif cv_mape is not None:
                 primary_mape = cv_mape
                 method_note = 'Time-series CV'
