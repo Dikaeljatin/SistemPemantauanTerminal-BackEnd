@@ -18,6 +18,7 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Install Python packages untuk forecasting
 RUN pip install --no-cache-dir \
+    flask \
     prophet \
     pandas \
     numpy \
