@@ -4,19 +4,24 @@ const rateLimit = require('express-rate-limit');
 
 const app = express();
 
-// CORS — hanya izinkan origin dari frontend
+// CORS — izinkan origin dari frontend
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000')
   .split(',')
   .map((o) => o.trim());
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Izinkan request tanpa origin (misal: Postman saat testing)
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Tidak diizinkan oleh CORS'));
+    // Izinkan request tanpa origin (misal: Postman)
+    if (!origin) return callback(null, true);
+    // Izinkan localhost untuk development
+    if (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) {
+      return callback(null, true);
     }
+    // Izinkan semua subdomain vercel.app
+    if (origin.endsWith('.vercel.app')) return callback(null, true);
+    // Izinkan origin yang terdaftar
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    callback(new Error('Tidak diizinkan oleh CORS'));
   },
   credentials: true,
 }));
