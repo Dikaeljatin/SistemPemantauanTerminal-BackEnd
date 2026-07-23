@@ -51,7 +51,7 @@ METRIC_CONFIG = {
     'masuk': {
         'changepoint_prior_scale': 0.5,
         'changepoint_range': 0.8,
-        'seasonality_mode': 'multiplicative',
+        'seasonality_mode': 'additive',
         'seasonality_prior_scale': 1.0,
         'window_days': None,
     },

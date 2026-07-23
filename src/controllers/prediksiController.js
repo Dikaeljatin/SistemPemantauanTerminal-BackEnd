@@ -105,6 +105,13 @@ exports.predict = async (req, res) => {
       };
     });
 
+    const totalMasuk = daily_history.reduce((s, r) => s + r.masuk, 0);
+    const totalKeluar = daily_history.reduce((s, r) => s + r.keluar, 0);
+    const hariAdaMasuk = daily_history.filter((r) => r.masuk > 0).length;
+    console.log(`[DEBUG PREDIKSI] Total hari data: ${daily_history.length}`);
+    console.log(`[DEBUG PREDIKSI] Total masuk (kedatangan) di DB: ${totalMasuk}, hari yg ada masuk: ${hariAdaMasuk}`);
+    console.log(`[DEBUG PREDIKSI] Total keluar (keberangkatan) di DB: ${totalKeluar}`);
+
     // Pola distribusi per jam: { "0": {masuk, keluar, penumpang}, ..., "23": {...} }
     const hourly_pattern = {};
     for (let h = 0; h < 24; h++) hourly_pattern[h] = { masuk: 0, keluar: 0, penumpang: 0 };
