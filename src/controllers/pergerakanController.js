@@ -785,8 +785,21 @@ exports.updatePergerakan = async (req, res) => {
     // Update nama perusahaan jika diberikan
     if (nama_perusahaan && result.rows[0].kendaraan_id) {
       const kendaraanRes = await pool.query('SELECT perusahaan_id FROM kendaraan WHERE kendaraan_id = $1', [result.rows[0].kendaraan_id]);
-      if (kendaraanRes.rows[0]?.perusahaan_id) {
-        await pool.query('UPDATE perusahaan SET nama_perusahaan = $1 WHERE perusahaan_id = $2', [nama_perusahaan, kendaraanRes.rows[0].perusahaan_id]);
+      const existingPerusahaanId = kendaraanRes.rows[0]?.perusahaan_id;
+      if (existingPerusahaanId) {
+        // Perusahaan sudah ada — update namanya
+        await pool.query('UPDATE perusahaan SET nama_perusahaan = $1 WHERE perusahaan_id = $2', [nama_perusahaan, existingPerusahaanId]);
+      } else {
+        // Kendaraan belum punya perusahaan — cari atau buat baru, lalu link ke kendaraan
+        let perusahaanId;
+        const cariPerusahaan = await pool.query('SELECT perusahaan_id FROM perusahaan WHERE nama_perusahaan = $1', [nama_perusahaan]);
+        if (cariPerusahaan.rows.length > 0) {
+          perusahaanId = cariPerusahaan.rows[0].perusahaan_id;
+        } else {
+          const buatPerusahaan = await pool.query('INSERT INTO perusahaan (nama_perusahaan) VALUES ($1) RETURNING perusahaan_id', [nama_perusahaan]);
+          perusahaanId = buatPerusahaan.rows[0].perusahaan_id;
+        }
+        await pool.query('UPDATE kendaraan SET perusahaan_id = $1 WHERE kendaraan_id = $2', [perusahaanId, result.rows[0].kendaraan_id]);
       }
     }
 
