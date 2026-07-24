@@ -65,8 +65,8 @@ exports.createUser = async (req, res) => {
     }
     const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
     const result = await pool.query(
-      'INSERT INTO users (nama, email, username, password, role) VALUES ($1, $2, $3, $4, $5) RETURNING user_id, nama, email, username, role',
-      [nama, email || null, username, hashedPassword, role]
+      'INSERT INTO users (nama, email, username, password, role, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING user_id, nama, email, username, role',
+      [nama, email || null, username, hashedPassword, role, 'aktif']
     );
     res.status(201).json({ message: 'User berhasil ditambahkan', data: result.rows[0] });
   } catch (error) {
