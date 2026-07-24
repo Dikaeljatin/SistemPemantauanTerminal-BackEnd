@@ -782,21 +782,20 @@ exports.updatePergerakan = async (req, res) => {
       await pool.query('UPDATE kendaraan SET tnkb = $1 WHERE kendaraan_id = $2', [tnkb, result.rows[0].kendaraan_id]);
     }
 
-    // Update nama perusahaan jika diberikan
-    if (nama_perusahaan && result.rows[0].kendaraan_id) {
-      const kendaraanRes = await pool.query('SELECT perusahaan_id FROM kendaraan WHERE kendaraan_id = $1', [result.rows[0].kendaraan_id]);
-      const existingPerusahaanId = kendaraanRes.rows[0]?.perusahaan_id;
-      if (existingPerusahaanId) {
-        // Perusahaan sudah ada — update namanya
-        await pool.query('UPDATE perusahaan SET nama_perusahaan = $1 WHERE perusahaan_id = $2', [nama_perusahaan, existingPerusahaanId]);
+    // Update nama perusahaan jika field dikirim
+    if (result.rows[0].kendaraan_id && nama_perusahaan !== undefined) {
+      if (!nama_perusahaan || nama_perusahaan.trim() === '') {
+        // User mengosongkan nama perusahaan — putus relasi kendaraan dari perusahaan
+        await pool.query('UPDATE kendaraan SET perusahaan_id = NULL WHERE kendaraan_id = $1', [result.rows[0].kendaraan_id]);
       } else {
-        // Kendaraan belum punya perusahaan — cari atau buat baru, lalu link ke kendaraan
+        // Cari perusahaan dengan nama tersebut, jika tidak ada buat baru, lalu link ke kendaraan
+        const trimmedNama = nama_perusahaan.trim();
+        const cariPerusahaan = await pool.query('SELECT perusahaan_id FROM perusahaan WHERE nama_perusahaan = $1', [trimmedNama]);
         let perusahaanId;
-        const cariPerusahaan = await pool.query('SELECT perusahaan_id FROM perusahaan WHERE nama_perusahaan = $1', [nama_perusahaan]);
         if (cariPerusahaan.rows.length > 0) {
           perusahaanId = cariPerusahaan.rows[0].perusahaan_id;
         } else {
-          const buatPerusahaan = await pool.query('INSERT INTO perusahaan (nama_perusahaan) VALUES ($1) RETURNING perusahaan_id', [nama_perusahaan]);
+          const buatPerusahaan = await pool.query('INSERT INTO perusahaan (nama_perusahaan) VALUES ($1) RETURNING perusahaan_id', [trimmedNama]);
           perusahaanId = buatPerusahaan.rows[0].perusahaan_id;
         }
         await pool.query('UPDATE kendaraan SET perusahaan_id = $1 WHERE kendaraan_id = $2', [perusahaanId, result.rows[0].kendaraan_id]);
